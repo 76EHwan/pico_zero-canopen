@@ -1,17 +1,19 @@
 /*
  * pico_zero-canopen
  *
- * RP2040-Zero / RP2350-Zero + SN65HVD230 로 CubeMars AK40-10 3대를 CAN 제어.
- * 중앙 제어부 -> USB CDC 시리얼(텍스트 명령) -> 이 보드 -> CAN 1 Mbps -> 모터 3대
+ * RP2040-Zero / RP2350-Zero 를 CANopen(CiA 301/402) 드라이브 게이트웨이로 만든다.
  *
- * 참고: AK40-10 은 CANopen(CiA 301/402) 이 아니라 CubeMars 자체 CAN 프로토콜
- *       (Servo 모드 / MIT 모드) 을 쓴다. src/ak_proto.c 참고.
+ *   CANopen 마스터 (Jetson Orin: ros2_canopen / python-canopen)
+ *        │ USB CDC 시리얼 위의 slcan (리눅스: slcand -> SocketCAN slcan0)
+ *   RP2350-Zero : CANopen 노드 3개 (노드 ID 1,2,3 = CiA 402 단일 축 드라이브 3대)
+ *        │ CAN 1 Mbps, CubeMars 자체 프로토콜 (Servo / MIT)
+ *   AK40-10 x3
  *
- *  core0: USB 시리얼 파서, 텔레메트리/이벤트 출력, 상태 LED, 워치독
- *  core1: can2040 IRQ + 고정 주기 제어 루프 (src/motor_ctrl.c)
+ *  core0: slcan, CANopen 스택, CiA 402 상태머신, 상태 LED, 워치독
+ *  core1: can2040 IRQ + 고정 주기 모터 제어 루프 (src/motor_ctrl.c)
  */
-#include <stdio.h>
-
+#include "cia402.h"
+#include "co_node.h"
 #include "config.h"
 #include "hardware/pio.h"
 #include "hardware/watchdog.h"
@@ -19,127 +21,128 @@
 #include "pico/multicore.h"
 #include "pico/status_led.h"
 #include "pico/stdlib.h"
-#include "serial_cmd.h"
+#include "pico/unique_id.h"
+#include "slcan.h"
 #include "usb_io.h"
+
+static co_node_t s_node[NUM_MOTORS];
+static const uint8_t k_node_id[NUM_MOTORS] = {CO_NODE_ID_1, CO_NODE_ID_2, CO_NODE_ID_3};
+static bool s_bus_stalled;
 
 static uint32_t now_ms(void) {
     return to_ms_since_boot(get_absolute_time());
 }
 
-static void print_event(const motor_evt_t *e) {
-    int m = e->motor + 1;
-    switch (e->type) {
-    case EVT_BOOT: usb_io_printf(true, "EVT BOOT %d\n", m); break;
-    case EVT_DISABLED: usb_io_printf(true, "EVT DISABLED %d\n", m); break;
-    case EVT_FAULT: usb_io_printf(true, "EVT FAULT %d %u %s\n", m, e->code, ak_err_name((uint8_t)e->code)); break;
-    case EVT_FAULT_CLEAR: usb_io_printf(true, "EVT FAULT_CLEAR %d\n", m); break;
-    case EVT_TIMEOUT: usb_io_printf(true, "EVT TIMEOUT all_motors_stopped\n"); break;
-    case EVT_CAN_OVERFLOW: usb_io_printf(true, "EVT CAN_OVERFLOW %u\n", e->code); break;
-    case EVT_CAN_STALL: usb_io_printf(true, "EVT CAN_STALL no_ack\n"); break;
-    case EVT_CAN_OK: usb_io_printf(true, "EVT CAN_OK\n"); break;
-    default: break;
-    }
+/* ---- slcan <-> CANopen 연결 ---- */
+
+static void co_send_cb(const can_frame_t *f, bool important) {
+    slcan_send(f, important);
 }
 
-static void print_monitor(const can_frame_t *f) {
-    char buf[48];
-    int n = snprintf(buf, sizeof(buf), f->ext ? "RX E %08lX %u " : "RX S %03lX %u ", (unsigned long)f->id, f->dlc);
-    for (int i = 0; i < f->dlc && n < (int)sizeof(buf) - 3; i++) n += snprintf(buf + n, sizeof(buf) - n, "%02X", f->data[i]);
-    buf[n++] = '\n';
-    usb_io_write(buf, (size_t)n, false);
+static void on_host_frame(const can_frame_t *f) {
+    uint64_t t = time_us_64();
+    for (int i = 0; i < NUM_MOTORS; i++) co_rx(&s_node[i], f, t);
 }
+
+static void on_open(void) {
+    /* 호스트가 채널을 열면 전원 투입처럼: 노드 초기화 + boot-up 송신 */
+    uint64_t t = time_us_64();
+    for (int i = 0; i < NUM_MOTORS; i++) co_reset_node(&s_node[i], t);
+}
+
+static void on_close(void) {
+    /* 마스터와 연결이 끊김 -> 0x6007 에 따라 정지 */
+    for (int i = 0; i < NUM_MOTORS; i++) co_app_comm_lost(&s_node[i], 0x8100);
+}
+
+static const slcan_io_t k_slcan_io = {
+    .write = usb_io_write,
+    .on_frame = on_host_frame,
+    .on_open = on_open,
+    .on_close = on_close,
+    .now_ms = now_ms,
+};
 
 /* 상태 LED (보드의 WS2812, GP16)
- *  파랑: USB 미연결 / 노랑: 연결됨, 모터 피드백 없음
- *  초록: 모터 피드백 수신 중 / 빨강: 모터 에러 또는 CAN ACK 없음 */
-static void update_led(bool connected) {
-    static uint32_t last_color = 0xFFFFFFFFu;
-    uint32_t t = now_ms();
-    bool fresh = false, fault = false;
+ *  파랑: slcan 채널 닫힘 / 노랑: 열림, 운전 중인 축 없음
+ *  초록: 운전 중(Operation enabled) / 빨강: 고장 또는 모터 CAN ACK 없음 */
+static void update_led(void) {
+    static uint32_t last = 0xFFFFFFFFu;
+    bool fault = s_bus_stalled, enabled = false;
     for (int i = 0; i < NUM_MOTORS; i++) {
-        motor_fb_t fb;
-        motor_ctrl_get_fb(i, &fb);
-        if (fb.valid && (t - fb.last_ms) < FB_STALE_MS) fresh = true;
-        if (fb.valid && fb.err != 0) fault = true;
+        cia402_state_t st = cia402_state(&s_node[i]);
+        fault |= (st == CIA402_FAULT || st == CIA402_FAULT_REACTION_ACTIVE);
+        enabled |= (st == CIA402_OPERATION_ENABLED);
     }
-    ctrl_status_t st;
-    motor_ctrl_get_status(&st);
-
     uint32_t color;
-    if (fault || st.bus_stalled) {
-        color = PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(40, 0, 0);
-    } else if (!connected) {
+    if (!slcan_is_open()) {
         color = PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0, 0, 24);
-    } else if (fresh) {
+    } else if (fault) {
+        color = PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(40, 0, 0);
+    } else if (enabled) {
         color = PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(0, 30, 0);
     } else {
         color = PICO_COLORED_STATUS_LED_COLOR_FROM_RGB(30, 18, 0);
     }
-    if (color == last_color) return;
-    last_color = color;
-
+    if (color == last) return;
+    last = color;
     if (colored_status_led_supported()) {
         colored_status_led_set_on_with_color(color);
     } else if (status_led_supported()) {
-        status_led_set_state(connected && fresh && !fault);
+        status_led_set_state(slcan_is_open() && !fault);
     }
 }
 
 int main(void) {
-    bool wd_reboot = watchdog_caused_reboot();
     stdio_init_all();
 
-    /* can2040 이 이 PIO 블록의 상태머신/명령어 메모리를 전부 쓴다.
-     * 다른 PIO 사용자(상태 LED)가 이 블록을 고르지 않도록 먼저 예약. */
+    /* can2040 이 이 PIO 블록 전체를 쓴다. 상태 LED 가 이 블록을 고르지 않도록 먼저 예약 */
     pio_claim_sm_mask(pio_get_instance(CAN_PIO_NUM), 0xF);
 
     motor_ctrl_init();
-    serial_cmd_init();
     multicore_launch_core1(motor_ctrl_core1_entry);
 
     status_led_init();
     watchdog_enable(WATCHDOG_MS, true);
 
-    bool was_connected = false;
-    uint64_t next_telem_us = 0;
+    pico_unique_board_id_t uid;
+    pico_get_unique_board_id(&uid);
+    uint32_t serial = ((uint32_t)uid.id[4] << 24) | ((uint32_t)uid.id[5] << 16) | ((uint32_t)uid.id[6] << 8) | uid.id[7];
+
+    co_set_sender(co_send_cb);
+    slcan_init(&k_slcan_io);
+    uint64_t t0 = time_us_64();
+    for (int i = 0; i < NUM_MOTORS; i++) co_node_init(&s_node[i], k_node_id[i], (uint8_t)i, serial + (uint32_t)i, t0);
+
     uint32_t next_wd_ms = 0, next_led_ms = 0;
     uint32_t last_hb = motor_ctrl_heartbeat();
 
     for (;;) {
-        uint32_t t = now_ms();
+        char buf[256];
+        size_t n = usb_io_read(buf, sizeof(buf));
+        if (n) slcan_feed(buf, n);
+        if (slcan_is_open() && !usb_io_connected()) slcan_close(); /* 포트가 닫힘 (DTR off) */
 
-        usb_io_poll(serial_cmd_handle_line);
-
-        bool connected = usb_io_connected();
-        if (connected && !was_connected) {
-            usb_io_printf(true, "READY pico_zero-canopen fw=%s motors=%d (HELP 로 명령 목록)\n", FW_VERSION, NUM_MOTORS);
-            if (wd_reboot) usb_io_printf(true, "EVT RESET watchdog\n");
+        uint64_t t = time_us_64();
+        for (int i = 0; i < NUM_MOTORS; i++) {
+            cia402_process(&s_node[i], t);
+            if (slcan_is_open()) co_process(&s_node[i], t);
         }
-        was_connected = connected;
 
         motor_evt_t e;
-        for (int n = 0; n < 16 && motor_ctrl_pop_event(&e); n++) print_event(&e);
-
-        can_frame_t f;
-        for (int n = 0; n < 32 && motor_ctrl_pop_monitor(&f); n++) print_monitor(&f);
-
-        uint32_t hz = serial_cmd_telem_hz();
-        if (hz && connected) {
-            uint64_t t_us = time_us_64();
-            if (t_us >= next_telem_us) {
-                next_telem_us = t_us + 1000000u / hz;
-                for (int i = 0; i < NUM_MOTORS; i++) serial_cmd_print_fb(i, false);
-            }
+        while (motor_ctrl_pop_event(&e)) {
+            if (e.type == EVT_CAN_STALL) s_bus_stalled = true;
+            if (e.type == EVT_CAN_OK) s_bus_stalled = false;
         }
 
-        if ((int32_t)(t - next_led_ms) >= 0) {
-            next_led_ms = t + 100;
-            update_led(connected);
+        uint32_t tm = now_ms();
+        if ((int32_t)(tm - next_led_ms) >= 0) {
+            next_led_ms = tm + 100;
+            update_led();
         }
-
         /* core1 루프가 살아 있을 때만 워치독을 먹인다 */
-        if ((int32_t)(t - next_wd_ms) >= 0) {
-            next_wd_ms = t + 50;
+        if ((int32_t)(tm - next_wd_ms) >= 0) {
+            next_wd_ms = tm + 50;
             uint32_t hb = motor_ctrl_heartbeat();
             if (hb != last_hb) {
                 last_hb = hb;
