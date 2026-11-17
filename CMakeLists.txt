@@ -37,32 +37,38 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(pico_zero-canopen
+set(APP_SOURCES
         pico_zero-canopen.c
         src/ak_proto.c
         src/can_bus.c
         src/motor_ctrl.c
-        src/serial_cmd.c
         src/usb_io.c
+        src/slcan.c
+        src/co_od.c
+        src/co_node.c
+        src/cia402.c
+        src/co_motor_pico.c
+)
+
+add_executable(pico_zero-canopen
+        ${APP_SOURCES}
         lib/can2040/src/can2040.c
 )
 
 pico_set_program_name(pico_zero-canopen "pico_zero-canopen")
-pico_set_program_version(pico_zero-canopen "1.0.0")
+pico_set_program_version(pico_zero-canopen "2.0.0")
 
 # can2040 은 인터럽트 지연에 민감 -> 플래시 캐시 미스가 없도록 전체를 RAM 에서 실행
 pico_set_binary_type(pico_zero-canopen copy_to_ram)
 set_source_files_properties(lib/can2040/src/can2040.c PROPERTIES COMPILE_OPTIONS "-O2")
-set_source_files_properties(
-        pico_zero-canopen.c src/ak_proto.c src/can_bus.c src/motor_ctrl.c src/serial_cmd.c src/usb_io.c
-        PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
+set_source_files_properties(${APP_SOURCES} PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra")
 
-# 중앙 제어부와는 USB CDC 시리얼로 통신 (UART stdio 는 사용 안 함)
+# 호스트(CANopen 마스터)와는 USB CDC 시리얼 위의 slcan 으로 통신 (UART stdio 는 사용 안 함)
 pico_enable_stdio_uart(pico_zero-canopen 0)
 pico_enable_stdio_usb(pico_zero-canopen 1)
 
 target_compile_definitions(pico_zero-canopen PRIVATE
-        # USB CDC 버퍼 확대 (기본 64 바이트) - 텔레메트리 3줄이 한 번에 들어가도록
+        # USB CDC 버퍼 확대 (기본 64 바이트) - slcan 프레임이 몰려도 버리지 않도록
         CFG_TUD_CDC_RX_BUFSIZE=1024
         CFG_TUD_CDC_TX_BUFSIZE=1024
         # 호스트가 읽지 않을 때 printf 가 오래 막히지 않도록 (기본 500 ms)
